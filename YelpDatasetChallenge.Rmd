@@ -1,0 +1,210 @@
+---
+title: 'Yelp Data-set Challenge Part 6: Predicting Whether Business is Open or Closed and Suggesting the Good Business Practices'
+author: "Lenka Kovalcinova (New Jersey Insitute of Technology, NJ, US), Martin Polacek (Stony Brook University, NY, US)"
+date: "December 31, 2015"
+output:
+  html_document: default
+  pdf_document:
+    keep_tex: yes
+    fig_caption: true
+---
+# Introduction
+This data analysis focuses on predicting the probability that a business will be closed in a near future and the reasons why the businesses have bad ratings. 
+
+We first model the average review dependcy on time and compute the probability of a business to stay open given and average star review. Secondly, we have an accurate way to suggest the changes in a bad business culture according to the practices of many bad businesses and customer reviews. We developed a natural langues processing (NLP) method for a semantic text analysis and select only the nouns in the customer reviews connected to the bad business practices.
+
+# Methods
+In this section, we introduce a couple of methods we used in order to have a prediction whether the business will remain open or whether it will close - in particular, we find a probability of the business to close.
+
+The following methods are used:
+
+1. simple histogram comparison of the number of received reviews for open/closed business
+
+2. recursive partition tree (rpart method in caret model training package in R) method used to find the decision tree on conditions specifying whether a certain business is/will be open/closed based on number of reviews and stars :
+    * the business data is divided into training set (70% of the data, randomly chosen) and testing set (the rest of data - 30%)
+    * training set is used to find the probability that the business is open given a number of conditions, specified in the results     section
+3. Non-linear curve fitting to find the dependence of the average rating on the time the business is/was open. We predict the average time for a duration of the business given the number of stars.
+4. Matkove metodky <3
+
+### Brief Motivation and Exploratory Analysis
+
+Below, we take the business data and quickly plot the variable pairs to see any dependence between the average number of stars, location of the business (longitude and latitude) and the fact whether a certain business is still running (open) or whether it was closes.
+
+```{r, echo=FALSE, cache=TRUE, message=FALSE, fig.height=3}
+library(jsonlite)
+library(lubridate)
+library(doParallel)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+
+dataBusiness <- readRDS("dataBusiness.rds")
+
+# some exploratory analysis, looking at classes, names, unique values
+dataBusiness<-as.data.frame(dataBusiness)
+businessNames<-sapply(dataBusiness,class)
+
+dataBusinessNumeric <- dataBusiness[,c(4,7,10,12,13)]
+pairs(dataBusinessNumeric)
+```
+
+From the above plot, we can see that businesses that are still open are reviewed more and that the number of stars tends to have an average 4 with the increasing number of reviews. Therefore, it seems that there might indeed be some correlation between the number of reviews, number of stars and the fact that the business is either open or closed.
+
+Before further analysis, we explore the data a little more and plot the average number of reviews for specific star for closed/open businesses, normalized by the number of businesses with a specific average star. The normalization is performed separately for open and closed businesses and the idea is to have comparable quantities.
+
+```{r, echo=FALSE, cache=TRUE, message=FALSE, fig.height=3}
+## selecting the data for the businesses that are closed and open
+closedStars<-dataBusiness[dataBusiness$open == F,]$stars
+openStars<-dataBusiness[dataBusiness$open == T,]$stars
+
+## selecting only data with numeric input
+newDataBusiness <- data.frame(open=as.numeric(dataBusiness$open), review_count=dataBusiness$review_count, 
+                              longitude = dataBusiness$longitude, stars = dataBusiness$stars, latitude = dataBusiness$latitude)
+newDataByStarsOpen <- group_by(newDataBusiness, stars, open)
+
+### sum of the reviews by stars and open/close business category
+reviewCountByStarsOpen<-summarize(newDataByStarsOpen, sum(review_count))
+names(reviewCountByStarsOpen)<-c("stars", "open", "review_count")
+
+reviewCountByStarsClosed<-filter(reviewCountByStarsOpen, open == 0)
+reviewCountByStarsOpen<-filter(reviewCountByStarsOpen, open == 1)
+
+## counting the number of stars for open/close businesses
+starsOpen <- group_by(dataBusiness[dataBusiness$open == 1,], stars)
+starsOpen<-summarize(starsOpen,n())
+names(starsOpen) = c("stars", "count")
+
+starsClose <- group_by(dataBusiness[dataBusiness$open == 0,], stars)
+starsClose<-summarize(starsClose,n())
+names(starsClose) = c("stars", "count")
+
+### find the number of reviews by stars for closed/open, normalized by the number of stars for close/open business
+countsPerReviewPerStar <- data.frame(stars=starsClose$stars,close=reviewCountByStarsClosed$review_count/starsClose$count,
+                                     open=reviewCountByStarsOpen$review_count/starsOpen$count)
+countsPerReviewPerStar<-melt(countsPerReviewPerStar,id=c("stars"))
+ggplot(countsPerReviewPerStar,aes(x=stars, y = value, fill=variable)) + geom_bar(stat="identity", alpha=0.6, position="dodge") + labs(title="Open and Close Businesses Normalized Review Count") + ylab("reviews")
+
+```
+
+From the above we can infer that the businesses that are closed have higher chance to have a bad average rating: 
+
+* if the business is closed, then it is more likely to have a bad average rating of 2.5 or 2 stars
+* if the business has a good rating (3-5 stars), then it is more likely to be still open and more likely to have many reviews
+
+***Note however,*** that a time for the business exists has a non-trivial influence on the above: 
+
+* if certain bad business is open for a short time, it might be more likely that it does not have enough bad reviews to close
+* if the business is open only for a short time, it might have bad average review because there is not enough good reviews yet
+* if certain good business is open for a long time, it might be more likely that it has more reviews
+
+Therefore, the above graph does not directly explain why a certain business stayed open or was closed and we will explain the time dependence and reasons for bad reviews in the next section.
+
+# Results
+Below, we present a classification tree, that gives a probability that a certain business is open/closed based on the number of stars and review count. The classification tree was computed using the rpart caret package that uses bootstrap resampling method to find an accurate classification.
+
+***Decision Tree Interpretation:*** To find the probability that a certain business will be open, we treat the open/closed identificator as a continuous variable and not as a factor. The root node (probability P=0.88) gives a probability that a certain business is open/closed. From the classification tree, if the business has more than 4.8 stars, the probability that it's open is 94%. The interpretation of the rest of the tree is analogous.
+
+```{r, cache=TRUE, fig.height=3,message=FALSE}
+library(rattle)
+# load the trained model for classification tree
+load("businessData.rda")
+modFit
+```
+
+![figure1](decision_tree.png)
+
+***Time Range Influence:*** 
+
+The following classification tree decides on the probability of a certain business to be open according to:
+
+* time range - in days - over which was the business open (obtained from the first and last review date)
+* average star rating
+* number of reviews (the trained model did not do the split on this variable)
+
+```{r, cache=TRUE, fig.height=3,message=FALSE}
+library(rattle)
+#
+load("modelWTimeRange.rda")
+model
+
+```
+
+![picture2](modelWithTimeRange.png)
+
+***Time vs. average rating:***
+
+Below we show the dependence of the mean time (in days) over which the business stays open. Since we have a dataset for a contraint time range, we want to make sure that the curve is robust with respect to the time window we take. Therefore, the plot contains the data for different subsets according to the time when first review was written. The subsets include businesses that are/were open the latest 2 years ago (in 2013) up to datasets with businesses open since 2004. The data points have size according to the dataset: for example, size 10 (maxYears = 10) means that that data point belongs to the dataset with businesses reviewed for the first time since 10 years ago. The data in datasets are rescaled by the maximum average time duration for open/closed business.
+
+![picture](starsMeanTimeOpenClose.png)
+
+Even for different datasets, we still see the same type of behavior and the curve fitted to the data for both open and closed businesses are a good fit. Grey lines show the standard deviation and we did not use any weights, i.e. datapoint corresponding to maxYears = 2 has the same weight as the datapoint for maxYears = 10.
+
+*Interpretation of the average rating - open time dependence*
+
+
+* Short duration of a 5 star businesses is (as we show below) due to the fact that a long-lasting business tends to receive also some bad reviews and so the average rating is smaller (around 4 stars). 
+
+* Businesses with 5 stars that are closed, were open only for a very short time (otherwise they would receive some bad rating and moved to the category with a worse average rating).
+
+* Businesses with very bad rating that are closed were open for a longer time than those that are still open. This suggests that the very bad businesses that are still open are inevitably heading to be (doomed) closed.
+
+* From the plot, we see that the average time for the existence of a 1 and 1.5 star business is approximately the same. The average duration of a very bad business is much shorter than that of a good business. 
+
+* Businesses with 3-4 stars are in general the businesses that are open for the longest time. If the business was closed than there is not a large difference in average opened time from bad businesses.
+
+## (Good) Businesses Get Worse Rating Over Time
+
+As the time passses, even the best business has the 'luck' of serving a demanding customers, resulting in worse ratings. Even in the case of very bad businesses, the average rating is decreasing over time.
+
+***As a result, the stars vs. average time open curve has a parabolic shape:*** good businesses cannot keep the great score and move to ~4 star businesses over time.
+
+We have verified that there is a decreasing tendency of the average rating over time, no matter what is the average rating. Below, we show a couple of plots for evolution in average rating over time.
+
+**Plot of time evolution of bad businesses (<=2 star average rating)**
+
+ Dots are specific businesses and color is different for a different business. Lines connect the same business over time.
+
+***Businesses open in 2006***
+
+![picture](badBusinessEvolution2006.png)
+
+***Businesses open in 2007*** 
+
+![picture](badBusinessEvolution2007.png)
+
+**Plot of time evolution of good businesses (>=4 star average rating)**
+
+Dots are specific businesses and color is different for a different business. Lines connect the same business over time.
+
+***Businesses open in 2004***
+
+![picture](goodBusinessEvolution2004.png)
+
+***Businesses open in 2005***
+
+![picture](goodBusinessEvolution2005.png)
+
+**Plot of time evolution of businesses with the average rating (>=3.5 and <2 star rating)**
+
+Dots are specific businesses and color is different for a different business. Lines connect the same business over time.
+
+***Businesses open in 2005***
+
+![picture](avgBusinessEvolution2005.png)
+
+***Businesses open in 2006***
+
+![picture](avgBusinessEvolution2006.png)
+
+
+## Suggesting Good Business Practices
+
+# Discussion
+
+We have shown that there are couple of factors that are connected to the fact whether a certain business is open or closed:
+
+* time range over which the business is already open
+* average rating
+* number of reviews
+
+In the future one could analyze the data set mode and find for example a typical time evolution of the average rating and the dependence on the number of reviews and the constant of reviews (for example what was a reason that the business received very bad reviews, etc.)
